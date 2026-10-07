@@ -3,6 +3,7 @@ use std::future::{self, Future};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tracing::Instrument;
 
 use crate::sync::AsyncSemaphoreReleaser;
 
@@ -22,6 +23,10 @@ pub struct PoolConnection<DB: Database> {
     live: Option<Live<DB>>,
     close_on_drop: bool,
     pub(crate) pool: Arc<PoolInner<DB>>,
+    // A checkout's context must not become part of the reusable connection.
+    // Retain it here so cancellation outside the request's poll still traces
+    // the cleanup task that SQLx already spawns.
+    span: tracing::Span,
 }
 
 pub(super) struct Live<DB: Database> {
@@ -199,13 +204,13 @@ impl<'c, DB: Database> crate::acquire::Acquire<'c> for &'c mut PoolConnection<DB
 impl<DB: Database> Drop for PoolConnection<DB> {
     fn drop(&mut self) {
         if self.close_on_drop {
-            crate::rt::spawn(self.take_and_close());
+            crate::rt::spawn(self.take_and_close().instrument(self.span.clone()));
             return;
         }
 
         // We still need to spawn a task to maintain `min_connections`.
         if self.live.is_some() || self.pool.options.min_connections > 0 {
-            crate::rt::spawn(self.return_to_pool());
+            crate::rt::spawn(self.return_to_pool().instrument(self.span.clone()));
         }
     }
 }
@@ -262,6 +267,7 @@ impl<DB: Database> Floating<DB, Live<DB>> {
             live: Some(inner),
             close_on_drop: false,
             pool,
+            span: tracing::Span::current(),
         }
     }
 
